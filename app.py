@@ -1,13 +1,26 @@
-from fastapi import FastAPI
+import os
+import json
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import networkx as nx
-import re
+from typing import List, Dict, Any
+from openai import OpenAI
 
-app = FastAPI()
+app = FastAPI(title="GraphMind Systems - GraphRAG API")
 
-########################################################################
-# MODELS
-########################################################################
+# Configure OpenAI client to route requests through AI Pipe
+# Default base_url points to AI Pipe's OpenRouter proxy endpoint
+AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN") or os.environ.get("AIPIPE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+BASE_URL = os.environ.get("AIPIPE_BASE_URL", "https://aipipe.org/openrouter/v1")
+
+client = OpenAI(
+    api_key=AIPIPE_TOKEN,
+    base_url=BASE_URL
+)
+
+# Model to use via AI Pipe (e.g. "openai/gpt-4o-mini" or "gpt-4o-mini")
+MODEL_NAME = os.environ.get("MODEL_NAME", "openai/gpt-4o-mini")
+
+# --- Pydantic Models ---
 
 class ExtractRequest(BaseModel):
     chunk_id: str
@@ -15,295 +28,96 @@ class ExtractRequest(BaseModel):
 
 class GraphQueryRequest(BaseModel):
     question: str
-    graph: dict
+    graph: Dict[str, Any]
 
-class CommunityRequest(BaseModel):
+class CommunitySummaryRequest(BaseModel):
     community_id: str
-    entities: list
-    relationships: list
+    entities: List[str]
+    relationships: List[Dict[str, str]]
 
-########################################################################
-# ENTITY HELPERS
-########################################################################
-
-ENTITY_TYPES = {
-    "Framework": [
-        "LangChain",
-        "LlamaIndex",
-        "Haystack",
-        "AutoGen",
-        "CrewAI",
-        "Semantic Kernel",
-        "DSPy"
-    ],
-    "Organization": [
-        "OpenAI",
-        "Microsoft",
-        "Google",
-        "Meta",
-        "Anthropic",
-        "NVIDIA",
-        "Apple",
-        "Amazon"
-    ],
-    "Product": [
-        "ChatGPT",
-        "GPT-4",
-        "GPT-3",
-        "Claude",
-        "Gemini",
-        "Copilot"
-    ]
-}
-
-def detect_entities(text):
-    entities = []
-
-    # predefined entities
-    for typ, values in ENTITY_TYPES.items():
-        for v in values:
-            if re.search(r"\b"+re.escape(v)+r"\b", text, re.I):
-                entities.append({"name":v,"type":typ})
-
-    # person detection
-    persons = re.findall(
-        r"\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b",
-        text
-    )
-
-    blacklist = set(sum(ENTITY_TYPES.values(), []))
-
-    for p in persons:
-        if p not in blacklist:
-            entities.append({"name":p,"type":"Person"})
-
-    # deduplicate
-
-    seen=set()
-    final=[]
-
-    for e in entities:
-        key=(e["name"],e["type"])
-        if key not in seen:
-            seen.add(key)
-            final.append(e)
-
-    return final
-
-########################################################################
-# RELATIONSHIP EXTRACTION
-########################################################################
-
-PATTERNS = [
-
-(
-r"(.+?) was created by (.+)",
-"CREATED"
-),
-
-(
-r"(.+?) was developed by (.+)",
-"DEVELOPED"
-),
-
-(
-r"(.+?) was founded by (.+)",
-"FOUNDED"
-),
-
-(
-r"(.+?) integrates with (.+)",
-"INTEGRATED_INTO"
-),
-
-(
-r"(.+?) integrated into (.+)",
-"INTEGRATED_INTO"
-),
-
-(
-r"(.+?) hired (.+)",
-"HIRED"
-),
-
-(
-r"(.+?) authored (.+)",
-"AUTHORED"
-),
-
-(
-r"(.+?) created (.+)",
-"CREATED"
-),
-
-(
-r"(.+?) developed (.+)",
-"DEVELOPED"
-),
-
-(
-r"(.+?) founded (.+)",
-"FOUNDED"
-)
-
-]
-
-def relationship_extract(text):
-
-    rels=[]
-
-    for pattern,rel in PATTERNS:
-
-        m=re.search(pattern,text,re.I)
-
-        if not m:
-            continue
-
-        left=m.group(1).strip(" .,")
-
-        right=m.group(2).strip(" .,")
-
-        if rel in ["CREATED","DEVELOPED","FOUNDED"]:
-
-            rels.append({
-                "source":right,
-                "target":left,
-                "relation":rel
-            })
-
-        elif rel=="HIRED":
-
-            rels.append({
-                "source":left,
-                "target":right,
-                "relation":rel
-            })
-
-        elif rel=="AUTHORED":
-
-            rels.append({
-                "source":left,
-                "target":right,
-                "relation":rel
-            })
-
-        else:
-
-            rels.append({
-                "source":left,
-                "target":right,
-                "relation":rel
-            })
-
-    return rels
-
-########################################################################
-# ENDPOINT 1
-########################################################################
+# --- Endpoints ---
 
 @app.post("/extract-graph")
-def extract_graph(req:ExtractRequest):
-
-    entities=detect_entities(req.text)
-
-    rels=relationship_extract(req.text)
-
-    return {
-        "entities":entities,
-        "relationships":rels
-    }
-
-########################################################################
-# GRAPH QUERY
-########################################################################
+def extract_graph(req: ExtractRequest):
+    system_prompt = """
+    You are an expert data extractor. Extract entities and relationships from the provided text.
+    Allowed Entity Types: Person, Organization, Product, Framework.
+    Allowed Relationship Types: FOUNDED, DEVELOPED, INTEGRATED_INTO, HIRED, AUTHORED, CREATED.
+    
+    Output strictly in JSON format with two keys:
+    - "entities": list of objects with "name" and "type".
+    - "relationships": list of objects with "source", "target", and "relation".
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": req.text}
+            ],
+            temperature=0
+        )
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/graph-query")
-def graph_query(req:GraphQueryRequest):
-
-    G=nx.Graph()
-
-    for e in req.graph["entities"]:
-        G.add_node(e["name"])
-
-    for r in req.graph["relationships"]:
-        G.add_edge(
-            r["source"],
-            r["target"],
-            relation=r["relation"]
+def graph_query(req: GraphQueryRequest):
+    system_prompt = """
+    You are a graph reasoning agent. You will be provided with a JSON knowledge graph (entities and relationships) and a question.
+    Perform multi-hop reasoning to find the answer.
+    
+    Output strictly in JSON format with three keys:
+    - "answer": The direct answer to the question.
+    - "reasoning_path": A list of entity names tracing the path from the starting entity to the answer.
+    - "hops": Integer representing the number of relationship edges traversed.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Graph: {json.dumps(req.graph)}\nQuestion: {req.question}"}
+            ],
+            temperature=0
         )
-
-    q=req.question.lower()
-
-    if "who" in q:
-
-        framework=None
-
-        org=None
-
-        for e in req.graph["entities"]:
-
-            if e["type"]=="Framework":
-                framework=e["name"]
-
-            if e["type"]=="Organization":
-                org=e["name"]
-
-        if framework and org:
-
-            try:
-                path=nx.shortest_path(G,org,framework)
-
-                creator=None
-
-                for r in req.graph["relationships"]:
-
-                    if r["target"]==framework and r["relation"] in [
-                        "CREATED",
-                        "DEVELOPED",
-                        "FOUNDED"
-                    ]:
-
-                        creator=r["source"]
-
-                        return {
-                            "answer":creator,
-                            "reasoning_path":[org,framework,creator],
-                            "hops":2
-                        }
-
-            except:
-                pass
-
-    return {
-        "answer":"Unknown",
-        "reasoning_path":[],
-        "hops":0
-    }
-
-########################################################################
-# COMMUNITY SUMMARY
-########################################################################
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/community-summary")
-def community(req:CommunityRequest):
-
-    names=", ".join(req.entities)
-
-    rels=[]
-
-    for r in req.relationships:
-        rels.append(
-            f'{r["source"]} {r["relation"]} {r["target"]}'
+def community_summary(req: CommunitySummaryRequest):
+    system_prompt = """
+    You are an AI tasked with summarizing a specific sub-community of a knowledge graph.
+    You will receive a community ID, a list of entities, and a list of relationships.
+    Write a concise, 1-2 sentence summary explaining how these entities are connected.
+    
+    Output strictly in JSON format with two keys:
+    - "community_id": The exact ID provided.
+    - "summary": The generated summary string.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            response_format={ "type": "json_object" },
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Community ID: {req.community_id}\nEntities: {json.dumps(req.entities)}\nRelationships: {json.dumps(req.relationships)}"}
+            ],
+            temperature=0.3
         )
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    summary=(
-        f"This community contains entities {names}. "
-        f"Key relationships include: "
-        + "; ".join(rels)
-        + "."
-    )
-
-    return {
-        "community_id":req.community_id,
-        "summary":summary
-    }
+@app.get("/")
+def health_check():
+    return {"status": "GraphRAG Server is running via AI Pipe"}
